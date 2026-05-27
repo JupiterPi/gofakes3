@@ -208,21 +208,25 @@ func (u *uploader) ListParts(bucket, object string, uploadID UploadID, marker in
 	}
 
 	var cnt int64
-	for partNumber, part := range mpu.parts[marker:] {
+	// Slicing parts re-bases the range index to zero, so use the part's own
+	// PartNumber (which equals its absolute index in mpu.parts) rather than
+	// the loop index. Otherwise pages after the first report wrong PartNumbers
+	// and a regressing NextPartNumberMarker, causing an infinite loop.
+	for _, part := range mpu.parts[marker:] {
 		if part == nil {
 			continue
 		}
 
 		if cnt >= limit {
 			result.IsTruncated = true
-			result.NextPartNumberMarker = partNumber
+			result.NextPartNumberMarker = part.PartNumber
 			break
 		}
 
 		result.Parts = append(result.Parts, ListMultipartUploadPartItem{
 			ETag:         part.ETag,
 			Size:         int64(len(part.Body)),
-			PartNumber:   partNumber,
+			PartNumber:   part.PartNumber,
 			LastModified: part.LastModified,
 		})
 

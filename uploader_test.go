@@ -1,8 +1,11 @@
 package gofakes3_test
 
 import (
+	"context"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/rclone/gofakes3"
 )
@@ -157,4 +160,72 @@ func TestListMultipartUploadParts(t *testing.T) {
 
 	// No parts should be returned after the upload is completed:
 	ts.assertListUploadPartsFails(gofakes3.ErrNoSuchUpload, defaultBucket, "foo", id, listUploadPartsOpts{})
+}
+
+// TestListMultipartUploadPartsPagination checks that paginating through the
+// parts of a multipart upload with a small MaxParts returns every part exactly
+// once, with the correct PartNumber, and that the marker advances rather than
+// looping. See https://github.com/rclone/rclone/issues/9460.
+func TestListMultipartUploadPartsPagination(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	ctx := context.Background()
+	svc := ts.s3Client()
+
+	const object = "foo"
+	id := ts.createMultipartUpload(defaultBucket, object, nil)
+
+	// Upload parts 1..numParts with distinct bodies so each ETag is unique.
+	const numParts = 7
+	wantETag := map[int32]string{}
+	for i := int32(1); i <= numParts; i++ {
+		part := ts.uploadPart(defaultBucket, object, id, i, []byte{'p', byte('0' + i)})
+		wantETag[i] = *part.ETag
+	}
+
+	// Page through the parts with MaxParts strictly less than numParts so
+	// more than one page is required.
+	const maxParts = 3
+	seen := map[int32]bool{}
+	var marker *string
+	for page := 1; ; page++ {
+		if page > numParts+1 {
+			t.Fatalf("pagination did not terminate after %d pages: marker stuck", page)
+		}
+
+		rs, err := svc.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:           aws.String(defaultBucket),
+			Key:              aws.String(object),
+			UploadId:         aws.String(id),
+			MaxParts:         aws.Int32(maxParts),
+			PartNumberMarker: marker,
+		})
+		ts.OK(err)
+
+		for _, p := range rs.Parts {
+			pn := *p.PartNumber
+			if pn < 1 || pn > numParts {
+				t.Fatalf("page %d: got out-of-range PartNumber %d", page, pn)
+			}
+			if seen[pn] {
+				t.Fatalf("page %d: duplicate PartNumber %d returned (pagination loop)", page, pn)
+			}
+			seen[pn] = true
+			if got := *p.ETag; got != wantETag[pn] {
+				t.Fatalf("page %d: PartNumber %d ETag mismatch: got %s want %s", page, pn, got, wantETag[pn])
+			}
+		}
+
+		if rs.IsTruncated == nil || !*rs.IsTruncated {
+			break
+		}
+		marker = rs.NextPartNumberMarker
+	}
+
+	for i := int32(1); i <= numParts; i++ {
+		if !seen[i] {
+			t.Fatalf("part %d was never returned by pagination", i)
+		}
+	}
 }
